@@ -1,0 +1,26 @@
+{
+  "name": "ilides-code",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Agente de programación en la terminal (OpenRouter) con subagentes, sesiones y undo.",
+  "license": "MIT",
+  "keywords": ["ai", "agent", "cli", "coding-agent", "openrouter", "llm", "terminal"],
+  "engines": { "node": ">=18" },
+  "bin": { "ilides": "dist/bin.mjs" },
+  "files": ["dist/bin.mjs", "dist/ilides.mjs", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc && node scripts/build-standalone.mjs",
+    "test": "node --test --import tsx test/**/*.test.ts",
+    "dev": "tsx src/cli/main.ts",
+    "prepublishOnly": "npm test && npm run build"
+  },
+  "dependencies": {
+    "openai": "^4.104.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

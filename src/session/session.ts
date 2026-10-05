@@ -1,0 +1,2 @@
+import { mkdir, writeFile } from 'node:fs/promises'; import { join } from 'node:path'; import { randomUUID } from 'node:crypto';
+export async function saveSession(workspace:string,data:Record<string,unknown>){const dir=join(workspace,'.ilides','sessions');await mkdir(dir,{recursive:true});const id=randomUUID();await writeFile(join(dir,id+'.json'),JSON.stringify({id,timestamp:new Date().toISOString(),...data},null,2));return id;}

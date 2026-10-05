@@ -1,0 +1,16 @@
+# Dependencias y build
+node_modules/
+dist/
+*.tgz
+
+# Datos locales del agente (sesiones, estado)
+.ilides/
+
+# Secrets
+.env
+.env.*
+
+# Sistema y herramientas internas
+.DS_Store
+.freebuff/
+.kilo/
