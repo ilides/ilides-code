@@ -56,7 +56,7 @@ export function subagentToolset(
     fileReadLimit: config.fileReadLimit,
     maxToolResultChars: config.maxToolResultChars,
     toolTimeoutMs: config.toolTimeoutMs,
-  });
+  }, { config });
   delete tools.task;
   delete tools.think;
   return tools;

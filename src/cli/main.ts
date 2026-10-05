@@ -7,13 +7,25 @@ import {
   loadConfig, saveConfig, loadProjectInstructions, configPath,
   loadApiKey, saveApiKey, clearApiKey, maskKey, type Config,
 } from '../config/config.js';
-import { makeTools, ChangeJournal } from '../tools/tools.js';
+import { makeTools, ChangeJournal, type ToolDef } from '../tools/tools.js';
 import { runAgentTurn, emptyState, type AgentState } from '../agent/agent.js';
 import { fetchModels } from '../providers/openrouter/models.js';
+import { loadCustomCommands, expandCommand } from './commands.js';
+import { buildRepoMap } from '../tools/repoMap.js';
+import { snapshot as ckSnapshot, listCheckpoints, rewind as ckRewind } from '../tools/checkpoint.js';
+import { loadMcpTools } from '../tools/mcp.js';
+import { completeOnce } from '../agent/complete.js';
+import { spawn } from 'node:child_process';
+import { rm } from 'node:fs/promises';
 
 const COMMANDS = [
   ['help', 'list of commands'],
   ['api [key|remove]', 'set, show or remove the OpenRouter API key'],
+  ['plan', 'toggle plan mode: explore read-only, present a plan, implement after approval'],
+  ['diff [path]', 'show pending changes (git diff)'],
+  ['commit [msg]', 'commit with an AI-generated message'],
+  ['checkpoints', 'list workspace snapshots'],
+  ['rewind [id]', 'restore the workspace to a checkpoint'],
   ['new', 'new conversation (resets context)'],
   ['agents', 'how subagents work (the task tool)'],
   ['resume', 'resume a previous session'],
@@ -54,8 +66,31 @@ function parseArgs(argv: string[]) {
   return o;
 }
 
+// Show help before any heavy initialization.
+if (parseArgs(process.argv.slice(2)).help) {
+  console.log(`ILIDES Code — coding agent for the terminal
+
+Usage:
+  ilides                     interactive session
+  ilides -p "task"           run one task and exit (non-interactive)
+  ilides -p "task" -y        non-interactive, auto-approve writes and commands
+
+Options:
+  -p, --prompt <text>   task to run in non-interactive mode
+  -m, --model <id>      OpenRouter model (e.g. openai/gpt-4o-mini)
+  -y, --yes             automatically approve writes and commands
+      --readonly        read-only mode
+  -h, --help            show this help
+
+API key: set it once with /api sk-or-... (or export OPENROUTER_API_KEY).
+In interactive mode type /help to see the commands.`);
+  process.exit(0);
+}
+
 const workspace = process.cwd();
-const projectInstructions = await loadProjectInstructions(workspace);
+const ilidesMd = await loadProjectInstructions(workspace);
+const repoMap = await buildRepoMap(workspace);
+const projectInstructions = [ilidesMd, repoMap].filter(Boolean).join('\n\n') || null;
 let config = await loadConfig();
 
 // API key: env var wins; otherwise use the key saved with /api <key>.
@@ -64,18 +99,28 @@ if (!process.env.OPENROUTER_API_KEY) {
   if (stored) process.env.OPENROUTER_API_KEY = stored;
 }
 
+// MCP servers (.ilides/mcp.json) — tools appear as mcp_<server>_<tool>.
+let mcpTools: Record<string, ToolDef> = {};
+try { mcpTools = await loadMcpTools(workspace); } catch { mcpTools = {}; }
+
+// Custom slash commands (.ilides/commands/*.md and ~/.ilides/commands/*.md).
+const customCommands = await loadCustomCommands(workspace);
+
+let planMode = false;
+let lastPromptTokens = 0;
+let budgetHit = false;
 let running = true;
 let lastCtrlC = 0;
 let abort: AbortController | null = null;
 let state: AgentState = emptyState(new ChangeJournal());
 let sessionId: string | null = null;
 let sessionFirstTask = '';
-const pricingCache = new Map<string, { in: number; out: number }>();
+const pricingCache = new Map<string, { in: number; out: number; context?: number }>();
 
 const rl = createInterface({
   input, output,
   completer: (line: string): [string[], string] => {
-    const names = COMMANDS.map(([c]) => '/' + c).filter(c => c.startsWith(line));
+    const names = [...COMMANDS.map(([c]) => '/' + c), ...[...customCommands.keys()].map(k => '/' + k)].filter(c => c.startsWith(line));
     return [names.length ? names : [], line];
   },
 });
@@ -156,9 +201,17 @@ async function loadPricing() {
       pricingCache.set(config.model, {
         in: parseFloat(m.pricing.prompt ?? '0') || 0,
         out: parseFloat(m.pricing.completion ?? '0') || 0,
+        context: m.context_length ?? 0,
       });
-    } else pricingCache.set(config.model, { in: 0, out: 0 });
+    } else pricingCache.set(config.model, { in: 0, out: 0, context: m?.context_length ?? 0 });
   } catch { pricingCache.set(config.model, { in: 0, out: 0 }); }
+}
+
+/** Context usage of the latest request vs the model window, in percent. */
+function ctxPct(): number | null {
+  const win = pricingCache.get(config.model)?.context;
+  if (!win || !lastPromptTokens) return null;
+  return Math.min(100, Math.round((lastPromptTokens / win) * 100));
 }
 
 async function cmdApi(args: string[]) {
@@ -230,10 +283,12 @@ async function cmdSet(args: string[]) {
   const [key, ...rest] = args;
   const value = rest.join(' ');
   const num = (k: keyof Config) => { const v = Number(value); if (Number.isFinite(v)) config = { ...config, [k]: v } as Config; };
-  if (!key) { console.log('Usage: /set <key> <value>. Keys: temperature, maxIterations, maxHistoryTurns, maxSubagentIterations, fileReadLimit, toolTimeoutMs, maxToolResultChars, budget'); return; }
+  if (!key) { console.log('Usage: /set <key> <value>. Keys: temperature, maxIterations, maxHistoryTurns, maxSubagentIterations, fileReadLimit, toolTimeoutMs, maxToolResultChars, budget, autoCompact, checkpoints, permissionMode'); return; }
   switch (key) {
     case 'temperature': case 'maxIterations': case 'maxHistoryTurns': case 'maxSubagentIterations': case 'fileReadLimit': case 'toolTimeoutMs': case 'maxToolResultChars': case 'budget':
       num(key as keyof Config); break;
+    case 'autoCompact': case 'checkpoints':
+      config = { ...config, [key]: /^(1|true|on|yes)$/i.test(value) } as Config; break;
     case 'permissionMode':
       if (['readonly', 'ask', 'auto'].includes(value)) config = { ...config, permissionMode: value as Config['permissionMode'] };
       break;
@@ -244,6 +299,101 @@ async function cmdSet(args: string[]) {
 }
 
 const SUMMARIZE = 'Summarize this conversation so work can continue: the user goal, files touched and changes made, decisions, current state and next steps. Be concise (max 200 words).';
+
+const runGit = (argv: string[]) =>
+  new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
+    const p = spawn('git', argv, { cwd: workspace, windowsHide: true });
+    let out = '', err = '';
+    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* gone */ } resolve({ code: null, out, err: err + '\n[timeout]' }); }, 60_000);
+    p.stdout.on('data', d => out += d);
+    p.stderr.on('data', d => err += d);
+    p.on('error', reject);
+    p.on('close', code => { clearTimeout(t); resolve({ code, out, err }); });
+  });
+
+const PLAN_ALLOWED = new Set(['read_file', 'list_files', 'glob', 'search', 'git_status', 'think', 'todo_write', 'web_fetch', 'web_search', 'view_image', 'exit_plan_mode']);
+
+/** Plan mode approval tool (Claude Code-style Enter/ExitPlanMode). */
+function makePlanTool(): ToolDef {
+  return {
+    description: 'Present your implementation plan and request approval. Call it once exploration is complete and you are ready to act; the user approves (then implement) or rejects (stay in plan mode and refine).',
+    parameters: {
+      type: 'object', properties: {
+        plan: { type: 'string', description: 'Full plan in markdown: goal, files to change, concrete steps, risks.' },
+      }, required: ['plan'], additionalProperties: false,
+    },
+    run: async ({ plan }) => {
+      output.write(`\n${PALETTE.cyan('┌─ PLAN')}\n${String(plan).split('\n').map(l => `${PALETTE.cyan('│')} ${l}`).join('\n')}\n${PALETTE.cyan('└' + '─'.repeat(50))}\n`);
+      const ans = (await rl.question('Approve plan and start implementing? [y/N] ')).trim();
+      if (/^y(es)?$/i.test(ans)) { planMode = false; return 'PLAN APPROVED. Execute the plan now.'; }
+      return 'PLAN REJECTED. Stay in plan mode: keep exploring with read-only tools, do not edit anything.';
+    },
+  };
+}
+
+async function cmdDiff(args: string[]) {
+  let r = await runGit(args.length ? ['diff', 'HEAD', '--', ...args] : ['diff', 'HEAD']);
+  if (r.code !== 0) r = await runGit(args.length ? ['diff', '--', ...args] : ['diff']);
+  const out = (r.out || '').trim();
+  if (!out) { console.log('(no pending changes)'); return; }
+  console.log(out.slice(0, 40_000) + (out.length > 40_000 ? `\n…[${out.length - 40_000} more chars]` : ''));
+}
+
+async function cmdCommit(args: string[]) {
+  const status = await runGit(['status', '--short']);
+  if (!status.out.trim()) { console.log('Nothing to commit.'); return; }
+  let msg = args.join(' ').trim();
+  if (!msg) {
+    let diff = (await runGit(['diff', 'HEAD']));
+    if (diff.code !== 0 || !diff.out) diff = await runGit(['diff']);
+    console.log(PALETTE.gray('● Generating commit message…'));
+    try {
+      msg = await completeOnce(
+        { ...config, temperature: 0.2 },
+        [
+          { role: 'system', content: 'You write git commit messages in conventional-commits style (type(scope): summary). Answer with the message only, first line max 72 chars. No quotes, no explanation.' },
+          { role: 'user', content: `Status:\n${status.out.slice(0, 4000)}\n\nDiff:\n${diff.out.slice(0, 30_000)}` },
+        ],
+        workspace,
+      );
+    } catch (e: any) { console.error(PALETTE.red('✗ Could not generate a message: ' + (e?.message ?? e))); return; }
+  }
+  console.log(`\n${PALETTE.bold(msg)}\n`);
+  const ok = /^y(es)?$/i.test((await rl.question('Commit? [y/N] ')).trim());
+  if (!ok) { console.log('Cancelled.'); return; }
+  const add = await runGit(['add', '-A']);
+  if (add.code !== 0) { console.error(PALETTE.red(add.err || 'git add failed')); return; }
+  const c = await runGit(['commit', '-m', msg]);
+  if (c.code !== 0) console.error(PALETTE.red(c.err || c.out));
+  else console.log(`${PALETTE.green('✓')} ${c.out.trim().split('\n').pop() ?? 'committed'}`);
+}
+
+async function cmdCheckpoints() {
+  const list = await listCheckpoints(workspace);
+  if (!list.length) { console.log('No checkpoints yet (enable with /set checkpoints true).'); return; }
+  list.forEach((c, i) => console.log(`${String(i + 1).padStart(3)}. ${PALETTE.gray(c.id)} (${c.files} files)`));
+  console.log(PALETTE.gray('Restore with /rewind [id]'));
+}
+
+async function cmdRewind(args: string[]) {
+  const list = await listCheckpoints(workspace);
+  const id = args[0] ?? list[0]?.id;
+  if (!id || !list.some(c => c.id === id)) { console.log(PALETTE.red('✗ Checkpoint not found. See /checkpoints.')); return; }
+  const confirm = /^y(es)?$/i.test((await rl.question(`Rewind workspace to ${id}? [y/N] `)).trim());
+  if (!confirm) { console.log('Cancelled.'); return; }
+  try {
+    const r = await ckRewind(workspace, id);
+    console.log(`${PALETTE.green('✓')} Restored ${r.restored.length} files to checkpoint ${id}`);
+    if (r.extras.length) {
+      console.log(PALETTE.gray('Files created after the checkpoint:') + '\n' + r.extras.slice(0, 20).map(f => '  ' + f).join('\n') + (r.extras.length > 20 ? `\n  … ${r.extras.length - 20} more` : ''));
+      const del = /^y(es)?$/i.test((await rl.question(`Delete these ${r.extras.length} files? [y/N] `)).trim());
+      if (del) {
+        for (const f of r.extras) await rm(join(workspace, f), { force: true });
+        console.log(`${PALETTE.green('✓')} Deleted ${r.extras.length} files`);
+      }
+    }
+  } catch (e: any) { console.error(PALETTE.red('✗ ' + (e?.message ?? e))); }
+}
 
 async function cmdCompact() {
   const keep = 6;
@@ -259,26 +409,41 @@ async function cmdCompact() {
   console.log(`${PALETTE.green('✓')} History compacted: ${state.messages.length} messages`);
 }
 
-async function handleCommand(raw: string) {
+/** Returns an expanded custom-command prompt to run, or null. */
+async function handleCommand(raw: string): Promise<string | null> {
   const [cmd, ...args] = raw.slice(1).split(/\s+/);
   switch (cmd) {
-    case 'exit': case 'quit': running = false; return;
+    case 'exit': case 'quit': running = false; return null;
     case 'help':
       for (const [c, d] of COMMANDS) console.log(`  ${PALETTE.cyan('/' + c.padEnd(18))} ${d}`);
-      return;
-    case 'api': await cmdApi(args); return;
+      if (customCommands.size) {
+        console.log(`\n  ${PALETTE.bold('Custom commands')} (from .ilides/commands/*.md)`);
+        for (const [n, c] of customCommands) console.log(`  ${PALETTE.cyan('/' + n.padEnd(18))} ${c.description}`);
+      }
+      return null;
+    case 'api': await cmdApi(args); return null;
+    case 'plan':
+      planMode = !planMode;
+      console.log(planMode
+        ? `${PALETTE.green('✓')} Plan mode ON — explore with read-only tools, then call exit_plan_mode with your plan.`
+        : `${PALETTE.green('✓')} Plan mode OFF — full toolset available.`);
+      return null;
+    case 'diff': await cmdDiff(args); return null;
+    case 'commit': await cmdCommit(args); return null;
+    case 'checkpoints': await cmdCheckpoints(); return null;
+    case 'rewind': await cmdRewind(args); return null;
     case 'new':
       state = emptyState(new ChangeJournal()); sessionId = null; sessionFirstTask = '';
       console.log(`${PALETTE.green('✓')} New conversation (clean context)`);
-      return;
-    case 'resume': await cmdResume(); return;
-    case 'model': await cmdModel(args); return;
-    case 'set': await cmdSet(args); return;
+      return null;
+    case 'resume': await cmdResume(); return null;
+    case 'model': await cmdModel(args); return null;
+    case 'set': await cmdSet(args); return null;
     case 'permissions':
       if (args[0] && ['readonly', 'ask', 'auto'].includes(args[0])) { config = { ...config, permissionMode: args[0] as Config['permissionMode'] }; await saveConfig(config); }
       console.log(`Permissions: ${config.permissionMode}`);
-      return;
-    case 'undo': console.log(await state.journal.undo()); return;
+      return null;
+    case 'undo': console.log(await state.journal.undo()); return null;
     case 'agents':
       console.log(`Subagents: the main agent can delegate subtasks with the ${PALETTE.bold('task')} tool.
   Each subagent:
@@ -289,22 +454,32 @@ async function handleCommand(raw: string) {
 
   Ideal for: exploring code, investigating alternatives in parallel,
   or running independent subtasks without polluting the main context.`);
-      return;
-    case 'compact': await cmdCompact(); return;
-    case 'config': console.log(config, '\nconfig:', configPath()); return;
-    case 'clear': output.write('\x1b[2J\x1b[H'); return;
+      return null;
+    case 'compact': await cmdCompact(); return null;
+    case 'config': console.log(config, '\nconfig:', configPath()); return null;
+    case 'clear': output.write('\x1b[2J\x1b[H'); return null;
     case 'status':
-      console.log({ workspace, model: config.model, permission: config.permissionMode, messages: state.messages.length });
-      return;
+      console.log({ workspace, model: config.model, permission: config.permissionMode, planMode, context: ctxPct() != null ? `${ctxPct()}%` : 'n/a', messages: state.messages.length });
+      return null;
     case 'cost': {
+      if (args[0] === 'reset') {
+        state.usage = emptyState(state.journal).usage;
+        lastPromptTokens = 0;
+        console.log(`${PALETTE.green('✓')} Usage counters reset (budget unchanged)`);
+        return null;
+      }
       await loadPricing();
       const c = estimateCost(state.usage);
       console.log(`Input: ${state.usage.inputTokens ?? '—'} | Output: ${state.usage.outputTokens ?? '—'} | Reasoning: ${state.usage.reasoningTokens ?? '—'} | Cached: ${state.usage.cachedTokens ?? '—'}`);
-      console.log(c != null ? `Estimated cost: $${c.toFixed(4)}` : PALETTE.gray('No pricing for ' + config.model));
-      return;
+      console.log(c != null ? `Estimated cost: $${c.toFixed(4)}${config.budget ? ` / budget $${config.budget}` : ''}` : PALETTE.gray('No pricing for ' + config.model));
+      return null;
     }
-    default:
+    default: {
+      const custom = customCommands.get(cmd);
+      if (custom) return expandCommand(custom, args.join(' '));
       console.log('Unknown command. Use /help.');
+      return null;
+    }
   }
 }
 
@@ -321,33 +496,68 @@ async function runTask(userInput: string) {
     const f = SPINNER[Date.now() / 80 % SPINNER.length | 0];
     title(`Thinking ${f}`);
   }, 100);
+  budgetHit = false;
 
   try {
     await loadPricing();
+    if (config.budget && config.budget > 0) {
+      const spent = estimateCost(state.usage);
+      if (spent != null && spent >= config.budget) {
+        console.error(PALETTE.red(`✗ Budget reached: $${spent.toFixed(4)} / $${config.budget} — task not started. Raise it: /set budget <usd> · clear usage: /cost reset`));
+        return;
+      }
+    }
+    if (config.checkpoints) {
+      const ck = await ckSnapshot(workspace);
+      if (ck) console.log(PALETTE.gray(`· checkpoint ${ck} saved — restore with /rewind`));
+    }
     console.log(PALETTE.gray('─'.repeat(55)));
-    const tools = makeTools(workspace, config.permissionMode, approve, state.journal, config, {
-      config,
-      signal,
-      projectInstructions,
-      events: {
-        onSubagentStart: (id, prompt, model) => output.write(`\n${PALETTE.magenta('⏺ subagent')} ${PALETTE.bold(id)} ${PALETTE.gray(`(${model}) → ${prompt.slice(0, 110)}`)}\n`),
-        onSubagentTool: (id, name, line, ok) => output.write(`  ${PALETTE.magenta('│')} ${ok ? PALETTE.green('✓') : PALETTE.red('✗')} ${PALETTE.gray(`${name}: ${line}`.slice(0, 140))}\n`),
-        onSubagentEnd: (id, r) => output.write(`${PALETTE.magenta('│')} ${PALETTE.gray(`${id} finished: ${r.report.split('\n').length}-line report`)}\n`),
-      },
-    });
+    let tools: Record<string, ToolDef> = {
+      ...makeTools(workspace, config.permissionMode, approve, state.journal, config, {
+        config,
+        signal,
+        projectInstructions,
+        events: {
+          onSubagentStart: (id, prompt, model) => output.write(`\n${PALETTE.magenta('⏺ subagent')} ${PALETTE.bold(id)} ${PALETTE.gray(`(${model}) → ${prompt.slice(0, 110)}`)}\n`),
+          onSubagentTool: (id, name, line, ok) => output.write(`  ${PALETTE.magenta('│')} ${ok ? PALETTE.green('✓') : PALETTE.red('✗')} ${PALETTE.gray(`${name}: ${line}`.slice(0, 140))}\n`),
+          onSubagentEnd: (id, r) => output.write(`${PALETTE.magenta('│')} ${PALETTE.gray(`${id} finished: ${r.report.split('\n').length}-line report`)}\n`),
+        },
+      }),
+      ...mcpTools,
+    };
+    if (planMode) {
+      tools = Object.fromEntries(Object.entries(tools).filter(([n]) => PLAN_ALLOWED.has(n)));
+      tools.exit_plan_mode = makePlanTool();
+    }
     const result = await runAgentTurn(userInput, workspace, config, tools, state, {
       signal,
       onDelta: t => { if (!gotFirst) { gotFirst = true; output.write('\n'); } chars += t.length; title(`Generating ~${Math.ceil(chars / 4)} tok`); output.write(t); },
       onToolStart: (name, args) => { gotFirst = true; output.write(`\n${PALETTE.cyan('⏺')} ${PALETTE.bold(name)} ${PALETTE.gray(args.slice(0, 120))}\n`); },
       onToolEnd: (name, res) => { const line = res.split('\n')[0]; output.write(`  ${res.startsWith('ERROR') ? PALETTE.red('✗') : PALETTE.green('✓')} ${PALETTE.gray(line.slice(0, 140))}\n`); void name; },
-      onUsage: u => { const c = estimateCost(u); title(`$${c != null ? c.toFixed(4) : '~' + u.outputTokens + ' tok'}`); },
+      onUsage: u => {
+        const c = estimateCost(u);
+        if (config.budget && config.budget > 0 && c != null && c >= config.budget) { budgetHit = true; abort?.abort(); }
+        void c;
+      },
+      onContext: t => {
+        lastPromptTokens = t;
+        const c = estimateCost(state.usage);
+        const pct = ctxPct();
+        title(`${c != null ? '$' + c.toFixed(4) : '~' + (state.usage.outputTokens ?? '?') + ' tok'}${pct != null ? ` · ctx ${pct}%` : ''}`);
+      },
     }, projectInstructions);
     await saveSession(result);
     const c = estimateCost(result.usage);
-    console.log(`\n\n${PALETTE.gray(`[${result.usage.outputTokens ?? '?'} tok out${c != null ? ` · ~$${c.toFixed(4)}` : ''} · /undo reverts changes · /cost details]`)}`);
+    const pct = ctxPct();
+    console.log(`\n\n${PALETTE.gray(`[${result.usage.outputTokens ?? '?'} tok out${c != null ? ` · ~$${c.toFixed(4)}` : ''}${pct != null ? ` · ctx ${pct}%` : ''} · /undo reverts changes · /cost details]`)}`);
+    if (config.autoCompact && pct != null && pct >= 85) {
+      console.log(PALETTE.gray('● Auto-compact: context is nearly full'));
+      await cmdCompact();
+    }
   } catch (e: any) {
     if (e?.name === 'AbortError' || signal.aborted) {
-      output.write(`\n${PALETTE.yellow('● Task cancelled — context kept, you can continue with another instruction')}\n`);
+      if (budgetHit) output.write(`\n${PALETTE.yellow('● Budget reached — task stopped. /set budget <usd> to raise it, /cost reset to clear usage.')}\n`);
+      else output.write(`\n${PALETTE.yellow('● Task cancelled — context kept, you can continue with another instruction')}\n`);
       await saveSession(state);
     } else {
       console.error(`\n${PALETTE.red('✗ ' + (e?.message ?? String(e)))}`);
@@ -390,7 +600,11 @@ if (argvOpts.prompt.length) {
   }
   const journal = new ChangeJournal();
   const oneShot = emptyState(journal);
-  const tools = makeTools(workspace, config.permissionMode, approve, journal, config, { config, projectInstructions });
+  if (config.checkpoints) await ckSnapshot(workspace);
+  let tools: Record<string, ToolDef> = {
+    ...makeTools(workspace, config.permissionMode, approve, journal, config, { config, projectInstructions }),
+    ...mcpTools,
+  };
   try {
     await runAgentTurn(prompt, workspace, config, tools, oneShot, {
       onDelta: t => process.stdout.write(t),
@@ -412,7 +626,13 @@ while (running) {
   catch { break; }
   if (!line) continue;
   while (line.endsWith('\\')) line = line.slice(0, -1) + '\n' + (await rl.question('  ')).trimEnd();
-  if (line.startsWith('/')) { try { await handleCommand(line); } catch (e: any) { console.error(PALETTE.red('✗ ' + (e?.message ?? e))); } continue; }
+  if (line.startsWith('/')) {
+    try {
+      const customPrompt = await handleCommand(line);
+      if (customPrompt) { if (!sessionFirstTask) sessionFirstTask = line; await runTask(customPrompt); }
+    } catch (e: any) { console.error(PALETTE.red('✗ ' + (e?.message ?? e))); }
+    continue;
+  }
   if (!process.env.OPENROUTER_API_KEY) { console.error(PALETTE.red('✗ No OpenRouter API key. Run /api sk-or-... (get one at https://openrouter.ai/keys)')); continue; }
   if (!sessionFirstTask) sessionFirstTask = line;
   await runTask(line);

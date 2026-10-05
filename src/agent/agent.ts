@@ -2,6 +2,8 @@ import { client } from '../providers/openrouter/client.js';
 import type { Config } from '../config/config.js';
 import type { ToolDef, ChangeJournal } from '../tools/tools.js';
 import type { SubagentEvents } from './subagents.js';
+import { loadHooks, runHooks } from '../tools/hooks.js';
+import { IMAGE_PREFIX, parseImageResult } from '../tools/image.js';
 
 export interface LiveUsage {
   inputTokens: number | null;
@@ -15,6 +17,7 @@ export interface RunEvents {
   onToolStart?: (name: string, args: string) => void;
   onToolEnd?: (name: string, result: string) => void;
   onUsage?: (u: LiveUsage) => void;
+  onContext?: (promptTokens: number) => void;
   subagentEvents?: SubagentEvents;
   signal?: AbortSignal;
 }
@@ -39,6 +42,7 @@ function systemPrompt(workspace: string, project?: string | null) {
     `- Make the smallest change that solves the task and follow the project's style.`,
     `- Prefer edit_file for surgical changes; write_file only for new files or full rewrites.`,
     `- Verify your changes (build/tests) with terminal_exec when relevant.`,
+    `- For web info use web_search/web_fetch; to see screenshots or designs use view_image; for long-running processes use background (start/output/kill).`,
     `- Never claim you did something you did not. If something fails, report it clearly.`,
     `- Answer in the user's language.`,
     project ? `\n# Project instructions (ILIDES.md)\n${project}` : '',
@@ -57,6 +61,7 @@ export async function executeToolCall(call: any, tools: Record<string, ToolDef>,
   }
   try {
     const out = String(await tool.run(args));
+    if (out.startsWith(IMAGE_PREFIX)) return out; // never truncate base64 image payloads
     return out.slice(0, maxChars);
   } catch (e: any) {
     return `ERROR: ${e?.message ?? String(e)}`;
@@ -75,6 +80,7 @@ export async function runAgentTurn(
   customSystem: string | null = null,
 ): Promise<AgentState> {
   const ai = client(config);
+  const hooks = await loadHooks(workspace);
   const defs = Object.entries(tools).map(([name, t]) => ({
     type: 'function' as const,
     function: { name, description: t.description, parameters: t.parameters },
@@ -148,19 +154,48 @@ export async function runAgentTurn(
         cachedTokens: (state.usage.cachedTokens ?? 0) + (u.cachedTokens ?? 0),
       };
       events.onUsage?.(state.usage);
+      if (usage.prompt_tokens != null) events.onContext?.(usage.prompt_tokens);
     }
 
     const message: any = { role: 'assistant', content: content || null };
     if (calls.length) message.tool_calls = calls;
     state.messages.push(message);
 
-    if (!calls.length) return state;
+    if (!calls.length) {
+      await runHooks('Stop', hooks, { workspace });
+      return state;
+    }
 
     for (const call of calls) {
       events.onToolStart?.(call.function.name, call.function.arguments);
-      const result = await executeToolCall(call, tools, config.maxToolResultChars);
-      events.onToolEnd?.(call.function.name, result);
-      state.messages.push({ role: 'tool', tool_call_id: call.id, content: result });
+      let input: unknown = call.function.arguments;
+      try { input = JSON.parse(call.function.arguments || '{}'); } catch { /* raw string */ }
+      const pre = await runHooks('PreToolUse', hooks, { workspace, tool: call.function.name, input });
+      let result: string;
+      if (pre.blocked) {
+        result = `ERROR: blocked by PreToolUse hook: ${pre.reason}`;
+      } else {
+        result = await executeToolCall(call, tools, config.maxToolResultChars);
+        const img = parseImageResult(result);
+        if (!img) {
+          const post = await runHooks('PostToolUse', hooks, { workspace, tool: call.function.name, input, output: result.slice(0, 20_000) });
+          if (post.notes.length) result += `\n[hooks] ${post.notes.join('; ')}`;
+        }
+      }
+      events.onToolEnd?.(call.function.name, result.startsWith(IMAGE_PREFIX) ? 'image attached' : result);
+      const img = parseImageResult(result);
+      if (img) {
+        state.messages.push({ role: 'tool', tool_call_id: call.id, content: `Image loaded (${img.mime}); it is attached in the following message.` });
+        state.messages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `(attached image from ${call.function.name}: ${img.mime})` },
+            { type: 'image_url', image_url: { url: `data:${img.mime};base64,${img.b64}` } },
+          ],
+        });
+      } else {
+        state.messages.push({ role: 'tool', tool_call_id: call.id, content: result });
+      }
     }
   }
 

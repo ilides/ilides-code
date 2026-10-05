@@ -17,6 +17,8 @@ export interface Config {
   fileReadLimit: number;           // max lines per read_file
   toolTimeoutMs: number;           // default timeout for terminal_exec
   maxToolResultChars: number;      // tool result truncation limit
+  autoCompact: boolean;            // summarize history automatically near the context limit
+  checkpoints: boolean;            // snapshot the workspace before each task (for /rewind)
 }
 
 const dir = join(homedir(), '.ilides');
@@ -36,6 +38,8 @@ export const defaults: Config = {
   fileReadLimit: 400,
   toolTimeoutMs: 120_000,
   maxToolResultChars: 12_000,
+  autoCompact: true,
+  checkpoints: true,
 };
 
 export async function loadConfig(): Promise<Config> {

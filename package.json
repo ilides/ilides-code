@@ -1,6 +1,6 @@
 {
   "name": "ilides-code",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Agente de programación en la terminal (OpenRouter) con subagentes, sesiones y undo.",
   "license": "MIT",

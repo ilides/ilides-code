@@ -5,6 +5,10 @@ import { safePath, dangerous, dangerousReason } from './security.js';
 import { runSubagent } from '../agent/subagents.js';
 import type { SubagentEvents } from '../agent/subagents.js';
 import type { Config } from '../config/config.js';
+import { backgroundTool } from './background.js';
+import { webFetchTool, webSearchTool } from './web.js';
+import { IMAGE_PREFIX, IMAGE_MIME } from './image.js';
+import { extname } from 'node:path';
 
 export type Approval = (action: string, detail: string) => Promise<boolean>;
 
@@ -44,6 +48,7 @@ export function makeTools(
   const taskSeq = { n: 1 };
   const signal = subagent?.signal;
   const subagentCtx = subagent;
+  const cfg = subagent?.config;
 
   const guard = async (action: string, detail: string, write: boolean) => {
     if (mode === 'readonly' && write) throw new Error('Read-only mode: write operation denied');
@@ -237,6 +242,38 @@ export function makeTools(
         return out.trim() || '(clean workspace, not a git repo, or no changes)';
       },
     },
+    web_fetch: {
+      description: 'Fetch a URL over HTTP(S) and return its readable text. Use for docs, error pages and any link the user gives you.',
+      parameters: {
+        type: 'object', properties: { url: { type: 'string', description: 'Absolute http(s) URL' } },
+        required: ['url'], additionalProperties: false,
+      },
+      ...webFetchTool(),
+    },
+    web_search: {
+      description: 'Search the web for current information. Returns an answer with sources as full URLs (uses OpenRouter web access).',
+      parameters: {
+        type: 'object', properties: { query: { type: 'string', description: 'What to search for' } },
+        required: ['query'], additionalProperties: false,
+      },
+      ...webSearchTool(cfg, workspace),
+    },
+    view_image: {
+      description: 'Open an image (png/jpg/jpeg/gif/webp) so you can SEE it — screenshots, diagrams, designs. The image is attached to the conversation for the vision-capable model.',
+      parameters: {
+        type: 'object', properties: { path: { type: 'string', description: 'Image path relative to the workspace' } },
+        required: ['path'], additionalProperties: false,
+      },
+      run: async ({ path }) => {
+        const full = await safePath(workspace, path);
+        const mime = IMAGE_MIME[extname(path).toLowerCase()];
+        if (!mime) return 'ERROR: unsupported image type. Use png, jpg, jpeg, gif or webp.';
+        const buf = await readFile(full);
+        if (buf.length > 8 * 1024 * 1024) return 'ERROR: image too large (max 8MB)';
+        return `${IMAGE_PREFIX}${mime}:${buf.toString('base64')}`;
+      },
+    },
+    background: backgroundTool(workspace, limits),
     task: {
       description: 'Delegate a self-contained subtask to an isolated subagent (no access to this conversation). The subagent investigates, uses tools and returns a final report. Use it for large explorations, broad searches or independent subtasks; NOT for trivial single-tool actions.',
       parameters: {
